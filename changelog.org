@@ -9,6 +9,119 @@
 
 * Changelog
 List of user-visible changes that have gone into each release
+** 4.0.0 (Unreleased)
+- Apache HTTP Client version 5 is now used - this is a major breaking change for almost all of the
+  internals of clj-http.
+- Removed slingshot dependency. clj-http exceptions are now regular exceptions
+- Removed deprecated :follow-redirects & :force-redirects options
+- Added an option to capture socket data as it is written out
+  https://github.com/dakrone/clj-http/pull/440
+
+** 3.11.0
+- Adds workaround for Async Multipart uploads greater than 25 kb (#574)
+  https://github.com/dakrone/clj-http/pull/574
+- Adds an additional style for multi-param-style added (#562)
+  https://github.com/dakrone/clj-http/pull/562
+- Close transit input stream after reading response (#565)
+  https://github.com/dakrone/clj-http/pull/565
+- Bump patch versions of apache httpcomponents to latest. (#569)
+  https://github.com/dakrone/clj-http/pull/569
+- Fixed decode-json-body (#568)
+  https://github.com/dakrone/clj-http/pull/568
+- Handle quoted parameter values in content type (#573)
+  https://github.com/dakrone/clj-http/pull/573
+** 3.10.3
+- Improve error message when using incompatible version of cheshire
+  https://github.com/dakrone/clj-http/pull/558
+- Properly handle "308 Permanent Redirect" status code
+  https://github.com/dakrone/clj-http/pull/554
+** 3.10.2
+- Fix performance regressions from #528
+  https://github.com/dakrone/clj-http/pull/546
+- Adds support for custom DNS Resolvers
+  https://github.com/dakrone/clj-http/pull/545
+- Buffer :debug output to improve readability
+  https://github.com/dakrone/clj-http/pull/544
+- Improve compatbility with GraalVM
+  https://github.com/dakrone/clj-http/pull/543
+- Bug fix: Check first byte before wrapping response stream with gunzip
+  https://github.com/dakrone/clj-http/pull/549
+** 3.10.1
+- JSON parsing is always strict. See [[file:README.org::*Incrementally%20JSON%20Parsing][README#Incrementally JSON Parsing]]. This is
+  a *breaking change* and users *must* upgrade to cheshire >= 5.9.0.
+  https://github.com/dakrone/clj-http/pull/507
+** 3.10.0
+- Add trust-manager and key-managers support to the client
+  https://github.com/dakrone/clj-http/pull/469
+- Improving consistency of connection option names
+  https://github.com/dakrone/clj-http/pull/483
+  https://github.com/dakrone/clj-http/issues/477
+- Ensure Socket Timeout is set for BasicHttpClientConnectionManager
+  https://github.com/dakrone/clj-http/pull/463
+- Reduce body allocation and copying
+  https://github.com/dakrone/clj-http/pull/475
+** 3.9.1
+- Fix body parsing when first byte value is 255
+  https://github.com/dakrone/clj-http/pull/449
+- Add custom =:unexceptional-status= option
+  https://github.com/dakrone/clj-http/pull/451
+** 3.9.0
+- Add support for reusable http clients, returning the client in =:http-client= and allowing one to
+  be specified (with the same setting) - https://github.com/dakrone/clj-http/issues/441
+- Cancelling the =Future= returned from an async http request now also aborts the HttpRequest object
+- Async connection managers no longer put the connection manager in an illegal ACTIVE state [[https://github.com/dakrone/clj-http/issues/443][#443]]
+- Added the =:cookie-spec= and =:cookie-policy-registry= options for specifying a custom cookie spec
+  for parsing cookies. Since clj-http doesn't rely on Apache's cookies handling, this is for
+  advanced users who wish to add their own cookie validation, or use Apache's handling instead of
+  clj-http's. It also allows a user who wants to registry a custom spec to reuse the spec without
+  creating it for every request. Semi-related to https://github.com/dakrone/clj-http/issues/444
+- Added support for caching HTTP responses from a server. This can dramatically speed up requests to
+  the same URL. Filling and invalidating the cache is handled by Apache's httpclient-cache project,
+  with configuration exposed under the =:cache= and =:cache-config= parameters in the option map.
+  https://github.com/dakrone/clj-http/issues/445
+
+** 3.8.0
+- Reintroduce the =:save-request= and =:debug-body= options
+- +Wrap nested querystring params before form params, fixing
+  https://github.com/dakrone/clj-http/issues/427+ Reverted, see further below
+- Merged https://github.com/dakrone/clj-http/pull/426 to allow an empty SSLGenericSocketFactory
+  context
+- Merged https://github.com/dakrone/clj-http/pull/424 to add :mime-subtype request parameter to
+  override mime subtype
+- create-multipart-entity with three arguments arity lets the selection of =HttpMultipartMode=
+- new request key :http-multipart-mode which is HttpMultipartMode/STRICT by default
+- Added =:ignore-nested-query-string=, =:flatten-nested-form-params=, and =:flatten-nested-keys=
+  options for finer-grained control over which nested parts of the request are flattened. Fixes
+  https://github.com/dakrone/clj-http/issues/427
+- Added =:http-builder-fns= and =:async-http-builder-fns= to support arbitrary customizations to the
+  =HttpClientBuilder= and =HttpAsyncClientBuilder=
+- Fixed an issue where redirects to a bad location could cause the async client to hang -
+  https://github.com/dakrone/clj-http/pull/435
+- =client/parse-url= now includes the original URL in the =:url= key
+- =core/get-cookie-policy= is now a multimethod. This allows users to customize the return of their
+  own cookie validation method.
+- Empty responses with coercion no longer throw exceptions when processing empty gzipped response
+  streams. Fixes https://github.com/dakrone/clj-http/issues/257
+
+** 3.7.0
+This list contains all the changes since 3.0.0.
+
+Added:
+- HttpRequestInterceptor support 155bd23
+- protocol-version and reason-phrase f430517
+- support for async HTTP requests (like Ring) 44d10ec
+- support for different multi-param encoding (:repeating, :array, :indexed) cddeb3e
+- Add unparse function aec7dd1
+- Added :redirect-strategy :graceful
+- Allow RequestConfig and HttpClientContext to be injected feb3c48
+
+Removed:
+- :save-request
+
+Changed:
+- re-written middleware using apache http client 4.5
+- Fix retry-handler to be added in correct place a2c31f5
+- POST Mutipart: Use charset "UTF-8" instead of "ASCII" as default charset to support internationalization 983508f
 
 ** 2.0.0
 - merged https://github.com/dakrone/clj-http/pull/274 to update Potemkin so it

@@ -9,7 +9,7 @@
   (:require [clojure.string :as s]
             [potemkin :as potemkin])
   (:import (java.util Locale)
-           (org.apache.http Header HeaderIterator)))
+           (org.apache.hc.core5.http Header)))
 
 (def special-cases
   "A collection of HTTP headers that do not follow the normal
@@ -80,7 +80,8 @@
 (defn header-iterator-seq
   "Takes a HeaderIterator and returns a seq of vectors of name/value
   pairs of headers."
-  [^HeaderIterator headers]
+  ;; TODO: add type hints back
+  [headers]
   (for [^Header h (iterator-seq headers)]
     [(.getName h) (.getValue h)]))
 
@@ -119,9 +120,14 @@
         mta)
   (with-meta [_ mta]
     (HeaderMap. m mta))
+
   clojure.lang.Associative
   (containsKey [_ k]
                (contains? m (normalize k)))
+  (entryAt [_ k]
+           (if (contains? m (normalize k))
+             (clojure.lang.MapEntry. k (get _ k))))
+
   (empty [_]
          (HeaderMap. {} nil)))
 

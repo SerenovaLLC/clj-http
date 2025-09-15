@@ -1,23 +1,24 @@
 (ns clj-http.client
   "Batteries-included HTTP client."
+  (:refer-clojure :exclude [get update])
   (:require [clj-http.conn-mgr :as conn]
             [clj-http.cookies :refer [wrap-cookies]]
             [clj-http.core :as core]
             [clj-http.headers :refer [wrap-header-map]]
             [clj-http.links :refer [wrap-links]]
-            [clj-http.util :refer [opt] :as util]
+            [clj-http.multipart :as multipart]
+            [clj-http.util :as util :refer [opt]]
+            [clojure.java.io :as io]
             [clojure.stacktrace :refer [root-cause]]
             [clojure.string :as str]
-            [clojure.walk :refer [keywordize-keys prewalk]]
-            [slingshot.slingshot :refer [throw+]])
-  (:import (java.io InputStream File ByteArrayOutputStream ByteArrayInputStream)
-           (java.net URL UnknownHostException)
-           (org.apache.http.entity BufferedHttpEntity ByteArrayEntity
-                                   InputStreamEntity FileEntity StringEntity)
-           (org.apache.http.impl.conn PoolingHttpClientConnectionManager)
-           (org.apache.http.impl.nio.conn PoolingNHttpClientConnectionManager)
-           (org.apache.http.impl.nio.client HttpAsyncClients))
-  (:refer-clojure :exclude [get update]))
+            [clojure.walk :refer [keywordize-keys prewalk]])
+  (:import [java.io BufferedReader ByteArrayOutputStream EOFException File InputStream]
+           [java.net UnknownHostException URL]
+           java.nio.charset.StandardCharsets
+           org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager
+           org.apache.hc.client5.http.impl.nio.PoolingAsyncClientConnectionManager
+           org.apache.hc.core5.http.ContentType
+           [org.apache.hc.core5.http.io.entity BufferedHttpEntity ByteArrayEntity FileEntity InputStreamEntity StringEntity]))
 
 ;; Cheshire is an optional dependency, so we check for it at compile time.
 (def json-enabled?
@@ -100,11 +101,12 @@
 
 (defn ^:dynamic parse-transit
   "Resolve and apply Transit's JSON/MessagePack decoding."
-  [in type & [opts]]
+  [^InputStream in type & [opts]]
   {:pre [transit-enabled?]}
-  (let [reader (ns-resolve 'cognitect.transit 'reader)
-        read (ns-resolve 'cognitect.transit 'read)]
-    (read (reader in type (transit-read-opts opts)))))
+  (when (pos? (.available in))
+    (let [reader (ns-resolve 'cognitect.transit 'reader)
+          read (ns-resolve 'cognitect.transit 'read)]
+      (read (reader in type (transit-read-opts opts))))))
 
 (defn ^:dynamic transit-encode
   "Resolve and apply Transit's JSON/MessagePack encoding."
@@ -126,14 +128,10 @@
   "Resolve and apply cheshire's json decoding dynamically."
   [& args]
   {:pre [json-enabled?]}
-  (apply (ns-resolve (symbol "cheshire.core") (symbol "decode")) args))
-
-(defn ^:dynamic json-decode-strict
-  "Resolve and apply cheshire's json decoding dynamically (with lazy parsing
-  disabled)."
-  [& args]
-  {:pre [json-enabled?]}
-  (apply (ns-resolve (symbol "cheshire.core") (symbol "decode-strict")) args))
+  (if-let [json-decode-fn (ns-resolve (symbol "cheshire.core") (symbol "parse-stream-strict"))]
+    (apply json-decode-fn args)
+    (throw
+     (IllegalStateException. "Missing #'cheshire.core/parse-stream-strict. Ensure the version of `cheshire` is >= 5.9.0"))))
 
 (defn ^:dynamic form-decode
   "Resolve and apply ring-codec's form decoding dynamically."
@@ -178,6 +176,7 @@
     {:scheme (keyword (.getProtocol url-parsed))
      :server-name (.getHost url-parsed)
      :server-port (when-pos (.getPort url-parsed))
+     :url url
      :uri (url-encode-illegal-characters (.getPath url-parsed))
      :user-info (if-let [user-info (.getUserInfo url-parsed)]
                   (util/url-decode user-info))
@@ -200,7 +199,17 @@
 
 ;; Statuses for which clj-http will not throw an exception
 (def unexceptional-status?
-  #{200 201 202 203 204 205 206 207 300 301 302 303 304 307})
+  #{200 201 202 203 204 205 206 207 300 301 302 303 304 307 308})
+
+(defn unexceptional-status-for-request?
+  [req status]
+  ((or (:unexceptional-status req) unexceptional-status?)
+   status))
+
+(defn unexceptional-status-for-request?
+  [req status]
+  ((or (:unexceptional-status req) unexceptional-status?)
+   status))
 
 ;; helper methods to determine realm of a response
 (defn success?
@@ -229,17 +238,17 @@
 
 (defn- exceptions-response
   [req {:keys [status] :as resp}]
-  (if (unexceptional-status? status)
+  (if (unexceptional-status-for-request? req status)
     resp
     (if (false? (opt req :throw-exceptions))
       resp
       (let [data (assoc resp :type ::unexceptional-status)]
         (if (opt req :throw-entire-message)
-          (throw+ data "clj-http: status %d %s" (:status %) resp)
-          (throw+ data "clj-http: status %s" (:status %)))))))
+          (throw (ex-info (format "clj-http: status %d %s" status resp) data))
+          (throw (ex-info (format "clj-http: status %s" status) data)))))))
 
 (defn wrap-exceptions
-  "Middleware that throws a slingshot exception if the response is not a
+  "Middleware that throws a ex-info exception if the response is not a
   regular response. If :throw-entire-message? is set to true, the entire
   response is used as the message, instead of just the status number."
   [client]
@@ -252,120 +261,13 @@
                (response (exceptions-response req resp)))
              raise))))
 
-(declare wrap-redirects)
 (declare reuse-pool)
-
-(defn- follow-redirect-request
-  [req redirect trace-redirects resp]
-  (-> req
-      (merge (parse-url redirect))
-      (dissoc :query-params)
-      (assoc :url redirect)
-      (assoc :trace-redirects trace-redirects)
-      (reuse-pool resp)))
-
-(defn follow-redirect
-  "Attempts to follow the redirects from the \"location\" header, if no such
-  header exists (bad server!), returns the response without following the
-  request."
-  [client {:keys [uri url scheme server-name server-port async? respond raise]
-           :as req}
-   {:keys [trace-redirects ^InputStream body] :as resp}]
-  (let [url (or url (str (name scheme) "://" server-name
-                         (when server-port (str ":" server-port)) uri))]
-    (if-let [raw-redirect (get-in resp [:headers "location"])]
-      (let [redirect (str (URL. (URL. url) raw-redirect))]
-        (try (.close body) (catch Exception _))
-        (if-not async?
-          ((wrap-redirects client)
-           (follow-redirect-request req redirect trace-redirects resp))
-          (if (some nil? [respond raise])
-            (raise
-             (IllegalArgumentException.
-              "If :async? is true, you must set :respond and :raise"))
-            ((wrap-redirects client)
-             (follow-redirect-request req redirect trace-redirects resp)
-             respond raise))))
-      ;; Oh well, we tried, but if no location is set, return the response
-      (if-not async?
-        resp
-        (respond resp)))))
 
 (defn- respond*
   [resp req]
-  (if (:async? req)
+  (if (opt req :async)
     ((:respond req) resp)
     resp))
-
-(defn- redirects-response
-  [client
-   {:keys [request-method max-redirects redirects-count trace-redirects url]
-    :or {redirects-count 1 trace-redirects []
-         ;; max-redirects default taken from Firefox
-         max-redirects 20}
-    :as req} {:keys [status] :as resp}]
-  (let [resp-r (assoc resp :trace-redirects
-                      (if url
-                        (conj trace-redirects url)
-                        trace-redirects))]
-    (cond
-      (false? (opt req :follow-redirects))
-      (respond* resp req)
-      (not (redirect? resp-r))
-      (respond* resp-r req)
-      (and max-redirects (> redirects-count max-redirects))
-      (if (opt req :throw-exceptions)
-        (throw+ resp-r "Too many redirects: %s" redirects-count)
-        (respond* resp-r req))
-      (= 303 status)
-      (follow-redirect client (assoc req :request-method :get
-                                     :redirects-count (inc redirects-count))
-                       resp-r)
-      (#{301 302} status)
-      (cond
-        (#{:get :head} request-method)
-        (follow-redirect client (assoc req :redirects-count
-                                       (inc redirects-count)) resp-r)
-        (opt req :force-redirects)
-        (follow-redirect client (assoc req
-                                       :request-method :get
-                                       :redirects-count (inc redirects-count))
-                         resp-r)
-        :else
-        (respond* resp-r req))
-      (= 307 status)
-      (if (or (#{:get :head} request-method)
-              (opt req :force-redirects))
-        (follow-redirect client (assoc req :redirects-count
-                                       (inc redirects-count)) resp-r)
-        (respond* resp-r req))
-      :else
-      (respond* resp-r req))))
-
-(defn ^:deprecated wrap-redirects
-  "Middleware that follows redirects in the response. A slingshot exception is
-  thrown if too many redirects occur. Options
-
-  :follow-redirects - default:true, whether to follow redirects
-  :max-redirects - default:20, maximum number of redirects to follow
-  :force-redirects - default:false, force redirecting methods to GET requests
-
-  In the response:
-
-  :redirects-count - number of redirects
-  :trace-redirects - vector of sites the request was redirected from"
-  [client]
-  (fn
-    ([req]
-     (redirects-response client req (client req)))
-    ([req respond raise]
-     (client req
-             #(redirects-response client
-                                  (assoc req :async? true
-                                         :respond respond
-                                         :raise raise)
-                                  %)
-             raise))))
 
 ;; Multimethods for Content-Encoding dispatch automatically
 ;; decompressing response bodies
@@ -421,80 +323,88 @@
 (defmulti coerce-response-body (fn [req _] (:as req)))
 
 (defmethod coerce-response-body :byte-array [_ resp]
-  (assoc resp :body (util/force-byte-array (:body resp))))
+  (update resp :body util/force-byte-array))
 
 (defmethod coerce-response-body :stream [_ resp]
-  (let [body (:body resp)]
-    (cond (instance? InputStream body) resp
-          ;; This shouldn't happen, but we plan for it anyway
-          (instance? (Class/forName "[B") body)
-          (assoc resp :body (ByteArrayInputStream. body)))))
+  (update resp :body util/force-stream))
+
+(defn- response-charset [response]
+  (or (-> response :content-type-params :charset)
+      "UTF-8"))
+
+(defmethod coerce-response-body :reader
+  [_ {:keys [body] :as resp}]
+  (let [header (get-in resp [:headers "content-type"])
+        parsed-values (util/parse-content-type header)
+        charset (response-charset parsed-values)]
+    (assoc resp :body (io/reader body :encoding charset))))
+
+(defn- can-parse-body? [{:keys [coerce] :as request} {:keys [status] :as _response}]
+  (or (= coerce :always)
+      (and (unexceptional-status-for-request? request status)
+           (or (nil? coerce)
+               (= coerce :unexceptional)))
+      (and (not (unexceptional-status-for-request? request status))
+           (= coerce :exceptional))))
+
+(defn- decode-json-body [body keyword? charset]
+  (let [^BufferedReader br (io/reader (util/force-stream body) :encoding charset)]
+    (try
+      (.mark br 1)
+      (let [first-char (int (try (.read br) (catch EOFException _ -1)))]
+        (case first-char
+          -1 nil
+          (do (.reset br)
+              (json-decode br keyword?))))
+      (finally (.close br)))))
+
+(defn- response-charset [response]
+  (or (-> response :content-type-params :charset)
+      "UTF-8"))
+
+(defmethod coerce-response-body :reader
+  [_ {:keys [body] :as resp}]
+  (let [header (get-in resp [:headers "content-type"])
+        parsed-values (util/parse-content-type header)
+        charset (response-charset parsed-values)]
+    (assoc resp :body (io/reader body :encoding charset))))
 
 (defn coerce-json-body
-  [{:keys [coerce]} {:keys [body status] :as resp} keyword? strict? & [charset]]
-  (let [^String charset (or charset (-> resp :content-type-params :charset)
-                            "UTF-8")
-        body (util/force-byte-array body)
-        decode-func (if strict? json-decode-strict json-decode)]
-    (if json-enabled?
-      (cond
-        (= coerce :always)
-        (assoc resp :body (decode-func (String. ^"[B" body charset) keyword?))
-
-        (and (unexceptional-status? status)
-             (or (nil? coerce) (= coerce :unexceptional)))
-        (assoc resp :body (decode-func (String. ^"[B" body charset) keyword?))
-
-        (and (not (unexceptional-status? status)) (= coerce :exceptional))
-        (assoc resp :body (decode-func (String. ^"[B" body charset) keyword?))
-
-        :else (assoc resp :body (String. ^"[B" body charset)))
-      (assoc resp :body (String. ^"[B" body charset)))))
+  [request {:keys [body] :as resp} keyword? & [charset]]
+  {:pre [json-enabled?]}
+  (let [charset (or charset (response-charset resp))
+        body (if (can-parse-body? request resp)
+               (decode-json-body body keyword? charset)
+               (util/force-string body charset))]
+    (assoc resp :body body)))
 
 (defn coerce-clojure-body
-  [request {:keys [body] :as resp}]
-  (let [^String charset (or (-> resp :content-type-params :charset) "UTF-8")
-        body            (util/force-byte-array body)]
+  [_request {:keys [body] :as resp}]
+  (let [charset (response-charset resp)
+        body            (util/force-string body charset)]
     (assoc resp :body (cond
                         (empty? body) nil
-                        edn-enabled? (parse-edn (String. ^"[B" body charset))
+                        edn-enabled? (parse-edn body)
                         :else (binding [*read-eval* false]
-                                (read-string (String. ^"[B" body charset)))))))
+                                (read-string body))))))
 
 (defn coerce-transit-body
-  [{:keys [transit-opts coerce] :as request}
-   {:keys [body status] :as resp} type & [charset]]
-  (let [^String charset (or charset (-> resp :content-type-params :charset)
-                            "UTF-8")
-        body (util/force-byte-array body)]
-    (if-not (empty? body)
-      (if transit-enabled?
-        (cond
-          (= coerce :always)
-          (assoc resp :body (parse-transit
-                             (ByteArrayInputStream. body) type transit-opts))
-
-          (and (unexceptional-status? status)
-               (or (nil? coerce) (= coerce :unexceptional)))
-          (assoc resp :body (parse-transit
-                             (ByteArrayInputStream. body) type transit-opts))
-
-          (and (not (unexceptional-status? status)) (= coerce :exceptional))
-          (assoc resp :body (parse-transit
-                             (ByteArrayInputStream. body) type transit-opts))
-
-          :else (assoc resp :body (String. ^"[B" body charset)))
-        (assoc resp :body (String. ^"[B" body charset)))
-      (assoc resp :body nil))))
+  [{:keys [transit-opts] :as request}
+   {:keys [body] :as resp} type & [charset]]
+  {:pre [transit-enabled?]}
+  (let [charset (or charset (response-charset resp))
+        body (if (can-parse-body? request resp)
+               (with-open [in (util/force-stream body)]
+                 (parse-transit in type transit-opts))
+               (util/force-string body charset))]
+    (assoc resp :body body)))
 
 (defn coerce-form-urlencoded-body
-  [request {:keys [body] :as resp}]
-  (let [^String charset (or (-> resp :content-type-params :charset) "UTF-8")
-        body-bytes (util/force-byte-array body)]
-    (if ring-codec-enabled?
-      (assoc resp :body (-> (String. ^"[B" body-bytes charset)
-                            form-decode keywordize-keys))
-      (assoc resp :body (String. ^"[B" body-bytes charset)))))
+  [_request {:keys [body] :as resp}]
+  {:pre [ring-codec-enabled?]}
+  (let [charset (response-charset resp)
+        body (util/force-string body charset)]
+    (assoc resp :body (-> body form-decode keywordize-keys))))
 
 (defmulti coerce-content-type (fn [req resp] (:content-type resp)))
 
@@ -527,16 +437,20 @@
          (coerce-content-type request))))
 
 (defmethod coerce-response-body :json [req resp]
-  (coerce-json-body req resp true false))
-
-(defmethod coerce-response-body :json-strict [req resp]
-  (coerce-json-body req resp true true))
-
-(defmethod coerce-response-body :json-strict-string-keys [req resp]
-  (coerce-json-body req resp false true))
+  (coerce-json-body req resp true))
 
 (defmethod coerce-response-body :json-string-keys [req resp]
-  (coerce-json-body req resp false false))
+  (coerce-json-body req resp false))
+
+;; There is no longer any distinction between strict and non-strict JSON parsing
+;; options.
+;;
+;; `:json-strict` and `:json-strict-string-keys` will be removed in a future version
+(defmethod coerce-response-body :json-strict [req resp]
+  (coerce-json-body req resp true))
+
+(defmethod coerce-response-body :json-strict-string-keys [req resp]
+  (coerce-json-body req resp false))
 
 (defmethod coerce-response-body :clojure [req resp]
   (coerce-clojure-body req resp))
@@ -552,10 +466,7 @@
 
 (defmethod coerce-response-body :default
   [{:keys [as]} {:keys [body] :as resp}]
-  (let [body-bytes (util/force-byte-array body)]
-    (cond
-      (string? as)  (assoc resp :body (String. ^"[B" body-bytes ^String as))
-      :else (assoc resp :body (String. ^"[B" body-bytes "UTF-8")))))
+  (assoc resp :body (util/force-string body (if (string? as) as "UTF-8"))))
 
 (defn- output-coercion-response
   [req {:keys [body] :as resp}]
@@ -588,36 +499,43 @@
   [{:keys [body body-encoding length]
     :or {^String body-encoding "UTF-8"} :as req}]
   (if body
-    (cond
-      (string? body)
-      (-> req (assoc :body (maybe-wrap-entity
-                            req (StringEntity. ^String body
-                                               ^String body-encoding))
-                     :character-encoding (or body-encoding
-                                             "UTF-8")))
-      (instance? File body)
-      (-> req (assoc :body
+    (let [content-type (if-let [content-type (get-in req [:headers "content-type"])]
+                         (ContentType/parse content-type)
+                         ContentType/DEFAULT_BINARY)]
+      (cond
+        (string? body)
+        (-> req (assoc :body (maybe-wrap-entity
+                              req (StringEntity.
+                                   ^String body
+                                   (.withCharset content-type StandardCharsets/UTF_8)))
+                       :character-encoding (or body-encoding
+                                               "UTF-8")))
+        (instance? File body)
+        (-> req (assoc :body
+                       (maybe-wrap-entity
+                        req (FileEntity. ^File body
+                                         content-type
+                                         StandardCharsets/UTF_8
+                                         ;; TODO: use ContentType here
+                                         ;;^String body-encoding
+                                         ))))
+
+        ;; A length of -1 instructs HttpClient to use chunked encoding.
+        (instance? InputStream body)
+        (-> req
+            (assoc :body
+                   (if length
+                     (InputStreamEntity. body length content-type)
                      (maybe-wrap-entity
-                      req (FileEntity. ^File body
-                                       ^String body-encoding))))
+                      req
+                      (InputStreamEntity. body -1 content-type)))))
 
-      ;; A length of -1 instructs HttpClient to use chunked encoding.
-      (instance? InputStream body)
-      (-> req
-          (assoc :body
-                 (if length
-                   (InputStreamEntity.
-                    ^InputStream body (long length))
-                   (maybe-wrap-entity
-                    req
-                    (InputStreamEntity. ^InputStream body -1)))))
+        (instance? (Class/forName "[B") body)
+        (-> req (assoc :body (maybe-wrap-entity
+                              req (ByteArrayEntity. body ContentType/DEFAULT_BINARY))))
 
-      (instance? (Class/forName "[B") body)
-      (-> req (assoc :body (maybe-wrap-entity
-                            req (ByteArrayEntity. body))))
-
-      :else
-      req)
+        :else
+        req))
     req))
 
 (defn wrap-input-coercion
@@ -760,21 +678,28 @@
      (second found))
    "UTF-8"))
 
-(defn- multi-param-suffix [index multi-param-style]
-  (case multi-param-style
-    :indexed (str "[" index "]")
-    :array "[]"
-    ""))
+(defn- multi-param-entries [key values multi-param-style encoding]
+  (let [key (util/url-encode (name key) encoding)
+        values (map #(util/url-encode (str %) encoding) values)]
+    (case multi-param-style
+      :indexed
+      (map-indexed #(vector (str key \[ %1 \]) %2) values)
+
+      :array
+      (map #(vector (str key "[]") %) values)
+
+      :comma-separated
+      ;; See sub-delims in https://tools.ietf.org/html/rfc3986#section-2.2
+      [[key (str/join "," values)]]
+
+      ;; default: repeat the key multiple times
+      (map #(vector key %) values))))
 
 (defn generate-query-string-with-encoding [params encoding multi-param-style]
   (str/join "&"
             (mapcat (fn [[k v]]
                       (if (sequential? v)
-                        (map-indexed
-                         #(str (util/url-encode (name k) encoding)
-                               (multi-param-suffix %1 multi-param-style)
-                               "="
-                               (util/url-encode (str %2) encoding)) v)
+                        (map #(str/join "=" %) (multi-param-entries k v multi-param-style encoding))
                         [(str (util/url-encode (name k) encoding)
                               "="
                               (util/url-encode (str v) encoding))]))
@@ -970,13 +895,12 @@
     request))
 
 (defn- nest-params-request
-  [{:keys [content-type] :as req}]
-  (if (or (nil? content-type)
-          (= content-type :x-www-form-urlencoded))
+  [{:keys [flatten-nested-keys] :as req}]
+  (if (seq flatten-nested-keys)
     (reduce
      nest-params
      req
-     [:query-params :form-params])
+     flatten-nested-keys)
     req))
 
 (defn wrap-nested-params
@@ -987,6 +911,33 @@
      (client (nest-params-request req)))
     ([req respond raise]
      (client (nest-params-request req) respond raise))))
+
+(defn- nested-keys-to-flatten
+  [{:keys [flatten-nested-keys] :as req}]
+  (when (and (or (not (nil? (opt req :ignore-nested-query-string)))
+                 (not (nil? (opt req :flatten-nested-form-params))))
+             flatten-nested-keys)
+    (throw (IllegalArgumentException.
+            (str "only :flatten-nested-keys or :ignore-nested-query-string/"
+                 ":flatten-nested-keys may be specified, not both"))))
+  (let [iqs-key (when-not (opt req :ignore-nested-query-string) :query-params)
+        ifp-key (when (opt req :flatten-nested-form-params) :form-params)]
+    (or flatten-nested-keys
+        (remove nil? (list iqs-key ifp-key)))))
+
+(defn wrap-flatten-nested-params
+  "Middleware wrapping options for whether or not to flatten `:query-params` and
+  `:form-params`. Modifies the request by adding a `:flatten-nested-keys`
+  sequence of the nested keys that will be flattened."
+  [client]
+  (fn
+    ([req]
+     (client
+      (assoc req :flatten-nested-keys (nested-keys-to-flatten req))))
+    ([req respond raise]
+     (client
+      (assoc req :flatten-nested-keys (nested-keys-to-flatten req))
+      respond raise))))
 
 (defn- url-request
   [req]
@@ -1055,54 +1006,49 @@
                #(respond (request-timing-response % start))
                raise)))))
 
-(defn- async-pooling-request
-  [req release]
-  (let [handler (:oncancel req)]
-    (assoc req :oncancel
-           (fn []
-             (release)
-             (when handler
-               (handler))))))
+(defn check-conflicting-socket-capture-opts
+  "Checks whether the request has multually exclusive options for socket capturing."
+  [req]
+  (when (util/opt req :capture-socket)
+    (when (or (some req #{:connection-manager :insecure})
+              conn/*connection-manager*)
+      (throw
+       (IllegalArgumentException.
+        (str "capturing sockets cannot be used with custom or "
+             "insecure connection manager"))))))
 
-(def ^:dynamic *pooling-info*
-  "The pooling-info used in pooling function"
-  nil)
-
-(defn wrap-async-pooling
-  "Middleware that handle pooling async request. It use the value of key
-  :pooling-info, the value is a map contains three key-value
-
-  :conn-mgr - connection manager used by the HttpAsyncClient
-  :allocate - a function with no args, will be invoked when connection allocate
-  :release  - a function with no args, will be invoked when connection finished
-
-  You must shutdown the conn-mgr when you don't need it."
+(defn wrap-capture-socket-traffic
+  "Middleware that uses a Socket proxy that can capture raw bytes being sent,
+  returning them in a :raw-socket-str and :raw-socket-bytes parameters in the
+  response."
   [client]
-  (fn
+  (fn wrap-capture-socket-traffic-fn
     ([req]
-     (client req))
+     (check-conflicting-socket-capture-opts req)
+     (if (util/opt req :capture-socket)
+       (let [baos (ByteArrayOutputStream.)
+             cm (conn/make-capturing-socket-conn-manager baos)
+             resp (client (assoc req :connection-manager cm))
+             bytes (.toByteArray baos)
+             charset (multipart/encoding-to-charset
+                      (or (:body-encoding req)
+                          (:character-encoding req)
+                          StandardCharsets/UTF_8))]
+         (assoc resp
+                :raw-socket-bytes bytes
+                :raw-socket-str (String. bytes charset)))
+       (client req)))
     ([req respond raise]
-     (if-let [pooling-info (or *pooling-info* (:pooling-info req))]
-       (let [{:keys [allocate release conn-mgr]} pooling-info]
-         (binding [conn/*async-connection-manager* conn-mgr]
-           (allocate)
-           (try
-             (client (async-pooling-request req release)
-                     (fn [resp]
-                       (respond (assoc resp :pooling-info pooling-info))
-                       (release))
-                     (fn [ex]
-                       (release)
-                       (raise ex)))
-             (catch Throwable ex
-               (release)
-               (throw ex)))))
+     (if (util/opt req :capture-socket)
+       (throw
+        (IllegalArgumentException.
+         (str "capturing socket traffic does not currently "
+              "work with async requests")))
        (client req respond raise)))))
 
 (def default-middleware
   "The default list of middleware clj-http uses for wrapping requests."
   [wrap-request-timing
-   wrap-async-pooling
    wrap-header-map
    wrap-query-params
    wrap-basic-auth
@@ -1115,12 +1061,14 @@
    ;; headers can be used if desired
    wrap-additional-header-parsing
    wrap-output-coercion
+   wrap-capture-socket-traffic
    wrap-exceptions
    wrap-accept
    wrap-accept-encoding
    wrap-content-type
    wrap-form-params
    wrap-nested-params
+   wrap-flatten-nested-params
    wrap-method
    wrap-cookies
    wrap-links
@@ -1176,8 +1124,8 @@
      (throw (IllegalArgumentException. "Host URL cannot be nil"))))
 
 (defn- request*
-  [{:keys [async?] :as req} [respond raise]]
-  (if async?
+  [req [respond raise]]
+  (if (opt req :async)
     (if (some nil? [respond raise])
       (throw (IllegalArgumentException.
               "If :async? is true, you must pass respond and raise"))
@@ -1292,17 +1240,18 @@
   If the value 'nil' is specified or the value is not set, the default value
   will be used."
   [opts & body]
+  ;; TODO: yes, absolutely!
   ;; I'm leaving the connection bindable for now because in the
   ;; future I'm toying with the idea of managing the connection
   ;; manager yourself and passing it into the request
-  `(let [cm# (conn/make-reusable-conn-manager ~opts)]
+  `(let [cm# (conn/make-conn-manager ~opts)]
      (binding [conn/*connection-manager* cm#]
        (try
          ~@body
          (finally
-           (.shutdown
+           (conn/shutdown-manager
             ^PoolingHttpClientConnectionManager
-            conn/*connection-manager*))))))
+            cm#))))))
 
 (defn reuse-pool
   "A helper function takes a request options map and a response map respond
@@ -1314,32 +1263,46 @@
     options))
 
 (defmacro with-async-connection-pool
+  "Macro to execute the body using a connection manager. Creates a
+  PoolingNHttpClientConnectionManager to use for all requests within the body of
+  the expression. An option map is allowed to set options for the connection
+  manager.
+
+  Handles the same options as `with-connection-pool` plus:
+  :io-config which should be a map containing some of the following keys:
+
+  :connect-timeout - int the default connect timeout value for connection
+    requests (default 0, meaning no timeout)
+  :interest-op-queued - boolean, whether or not I/O interest operations are to
+    be queued and executed asynchronously or to be applied to the underlying
+    SelectionKey immediately (default false)
+  :io-thread-count - int, the number of I/O dispatch threads to be used
+    (default is the number of available processors)
+  :rcv-buf-size - int the default value of the SO_RCVBUF parameter for
+    newly created sockets (default is 0, meaning the system default)
+  :select-interval - long, time interval in milliseconds at which to check for
+    timed out sessions and session requests (default 1000)
+  :shutdown-grace-period - long, grace period in milliseconds to wait for
+    individual worker threads to terminate cleanly (default 500)
+  :snd-buf-size - int, the default value of the SO_SNDBUF parameter for
+    newly created sockets (default is 0, meaning the system default)
+  :so-keep-alive - boolean, the default value of the SO_KEEPALIVE parameter for
+    newly created sockets (default false)
+  :so-linger - int, the default value of the SO_LINGER parameter for
+    newly created sockets (default -1)
+  :so-timeout - int, the default socket timeout value for I/O operations
+    (default 0, meaning no timeout)
+  :tcp-no-delay - boolean, the default value of the TCP_NODELAY parameter for
+    newly created sockets (default true)
+
+  If the value 'nil' is specified or the value is not set, the default value
+  will be used."
   [opts & body]
-  `(let [cm# (conn/make-reuseable-async-conn-manager ~opts)
-         count# (atom 0)
-         all-requested# (atom false)
-         p-info# {:conn-mgr cm#
-                  :allocate (fn [] (swap! count# inc))
-                  :release  (fn [] (swap! count# dec))}
-         ;; A http client hold the conn-mgr and start the io-reactor.
-         ;; In this context any other client's ConnectionManagerShared will be
-         ;; set to true.
-         holder-client# (-> (HttpAsyncClients/custom)
-                            (.setConnectionManager cm#)
-                            (.build)
-                            (.start))]
-     (add-watch count# :close-conn-mgr
-                (fn [key# identity# old# new#]
-                  (if (and (not= old# new#) (<= new# 0) @all-requested#)
-                    (.shutdown
-                     ^PoolingNHttpClientConnectionManager
-                     cm#))))
-     (binding [*pooling-info* p-info#]
+  `(let [cm# (conn/make-async-conn-manager ~opts)]
+     (binding [conn/*async-connection-manager* cm#]
        (try
          ~@body
          (finally
-           (swap! all-requested# not)
-           (if (= 0 @count#)
-             (.shutdown
-              ^PoolingNHttpClientConnectionManager
-              cm#)))))))
+           (conn/shutdown-manager
+            ^PoolingAsyncClientConnectionManager
+            cm#))))))

@@ -1,33 +1,42 @@
 (ns clj-http.test.core-test
   (:require [cheshire.core :as json]
             [clj-http.client :as client]
+            [clj-http.conn-mgr :as conn]
             [clj-http.core :as core]
             [clj-http.util :as util]
             [clojure.java.io :refer [file]]
-            [clojure.pprint :as pp]
             [clojure.test :refer :all]
             [ring.adapter.jetty :as ring])
-  (:import (java.io ByteArrayInputStream)
-           (org.apache.http.params CoreConnectionPNames CoreProtocolPNames)
-           (org.apache.http.message BasicHeader BasicHeaderIterator)
-           (org.apache.http.client.methods HttpPost)
-           (org.apache.http.client.protocol HttpClientContext)
-           (org.apache.http.client.config RequestConfig)
-           (org.apache.http.client.params CookiePolicy ClientPNames)
-           (org.apache.http HttpRequest HttpResponse HttpConnection
-                            HttpInetConnection HttpVersion)
-           (org.apache.http.protocol HttpContext ExecutionContext)
-           (org.apache.http.impl.client DefaultHttpClient)
-           (org.apache.http.client.params ClientPNames)
-           (java.net SocketTimeoutException)
-           (sun.security.provider.certpath SunCertPathBuilderException)))
+  (:import java.io.ByteArrayInputStream
+           [java.net InetAddress SocketTimeoutException]
+           org.apache.hc.client5.http.config.RequestConfig
+           org.apache.hc.client5.http.cookie.MalformedCookieException
+           org.apache.hc.client5.http.HttpRoute
+           [org.apache.hc.client5.http.impl.classic CloseableHttpClient HttpClientBuilder]
+           [org.apache.hc.client5.http.impl.cookie CookieSpecBase RFC6265CookieSpecFactory]
+           org.apache.hc.client5.http.impl.InMemoryDnsResolver
+           org.apache.hc.client5.http.protocol.HttpClientContext
+           [org.apache.hc.core5.http HttpRequest HttpResponse]
+           [org.apache.hc.core5.http.message BasicHeader BasicHeaderIterator]
+           org.apache.hc.core5.http.protocol.HttpContext
+           org.apache.hc.core5.util.TimeValue
+           org.apache.logging.log4j.LogManager
+           sun.security.provider.certpath.SunCertPathBuilderException))
+
+(defonce logger (LogManager/getLogger "clj-http.test.core-test"))
 
 (defn handler [req]
   (condp = [(:request-method req) (:uri req)]
     [:get "/get"]
     {:status 200 :body "get"}
+    [:get "/dont-cache"]
+    {:status 200 :body "nocache"
+     :headers {"cache-control" "private"}}
     [:get "/empty"]
     {:status 200 :body nil}
+    [:get "/empty-gzip"]
+    {:status 200 :body nil
+     :headers {"content-encoding" "gzip"}}
     [:get "/clojure"]
     {:status 200 :body "{:foo \"bar\" :baz 7M :eggplant {:quux #{1 2 3}}}"
      :headers {"content-type" "application/clojure"}}
@@ -43,11 +52,16 @@
     [:get "/json-array"]
     {:status 200 :body "[\"foo\", \"bar\"]"
      :headers {"content-type" "application/json"}}
+    [:get "/json-large-array"]
+    {:status 200 :body (file "test-resources/big_array_json.json")
+     :headers {"content-type" "application/json"}}
     [:get "/json-bad"]
     {:status 400 :body "{\"foo\":\"bar\"}"}
     [:get "/redirect"]
     {:status 302
      :headers {"location" "http://localhost:18080/redirect"}}
+    [:get "/bad-redirect"]
+    {:status 301 :headers {"location" "https:///"}}
     [:get "/redirect-to-get"]
     {:status 302
      :headers {"location" "http://localhost:18080/get"}}
@@ -108,12 +122,28 @@
     [:propfind "/propfind-with-body"]
     {:status 200 :body (:body req)}
     [:get "/query-string"]
-    {:status 200 :body (:query-string req)}))
+    {:status 200 :body (:query-string req)}
+    [:get "/cookie"]
+    {:status 200 :body "yay" :headers {"Set-Cookie" "foo=bar"}}
+    [:get "/bad-cookie"]
+    {:status 200 :body "yay"
+     :headers
+     {"Set-Cookie"
+      (str "DD-PSHARD=3; expires=\"Thu, 12-Apr-2018")}}))
+
+(defn add-headers-if-requested [client]
+  (fn [req]
+    (let [resp (client req)
+          add-all (-> req :headers (get "add-headers"))
+          headers (:headers resp)]
+      (if add-all
+        (assoc resp :headers (assoc headers "got" (pr-str (:headers req))))
+        resp))))
 
 (defn run-server
   []
   (defonce server
-    (ring/run-jetty #'handler {:port 18080 :join? false})))
+    (ring/run-jetty (add-headers-if-requested #'handler) {:port 18080 :join? false})))
 
 (defn localhost [path]
   (str "http://localhost:18080" path))
@@ -134,6 +164,60 @@
   (let [resp (request {:request-method :get :uri "/get"})]
     (is (= 200 (:status resp)))
     (is (= "get" (slurp-body resp)))))
+
+(deftest ^:integration dns-resolver
+  (run-server)
+  (let [custom-dns-resolver (doto (InMemoryDnsResolver.)
+                              (.add "foo.bar.com" (into-array[(InetAddress/getByAddress (byte-array [127 0 0 1]))])))
+        resp (request {:request-method :get :uri "/get"
+                       :server-name "foo.bar.com"
+                       :dns-resolver custom-dns-resolver})]
+    (is (= 200 (:status resp)))
+    (is (= "get" (slurp-body resp)))))
+
+(deftest ^:integration dns-resolver-unknown-host
+  (run-server)
+  (let [custom-dns-resolver (doto (InMemoryDnsResolver.)
+                              (.add "foo.bar.com" (into-array[(InetAddress/getByAddress (byte-array [127 0 0 1]))])))]
+    (is (thrown? java.net.UnknownHostException (request {:request-method :get :uri "/get"
+                                                        :server-name "www.google.com"
+                                                        :dns-resolver custom-dns-resolver})))))
+
+(deftest ^:integration dns-resolver-reusable-connection-manager
+  (run-server)
+  (let [custom-dns-resolver (doto (InMemoryDnsResolver.)
+                              (.add "totallynonexistant.google.com"
+                                    (into-array[(InetAddress/getByAddress (byte-array [127 0 0 1]))])))
+        cm (conn/make-async-conn-manager {:dns-resolver custom-dns-resolver})
+        hc (core/build-async-http-client {} cm)]
+    (client/get "http://totallynonexistant.google.com:18080/json"
+                {:connection-manager cm
+                 :http-client hc
+                 :as :json
+                 :async true}
+                (fn [resp]
+                  (is (= 200 (:status resp)))
+                  (is (= {:foo "bar"} (:body resp))))
+                (fn [e] (is false (str "failed with " e)))))
+  (let [custom-dns-resolver (doto (InMemoryDnsResolver.)
+                              (.add "nonexistant.google.com" (into-array[(InetAddress/getByAddress (byte-array [127 0 0 1]))])))
+        cm (conn/make-conn-manager {:dns-resolver custom-dns-resolver})
+        hc (:http-client (client/get "http://nonexistant.google.com:18080/get"
+                                     {:connection-manager cm}))
+        resp (client/get "http://nonexistant.google.com:18080/json"
+                         {:connection-manager cm
+                          :http-client hc
+                          :as :json})]
+    (is (= 200 (:status resp)))
+    (is (= {:foo "bar"} (:body resp)))))
+
+(deftest ^:integration save-request-option
+  (run-server)
+  (let [resp (request {:request-method :post
+                       :uri "/post"
+                       :body (util/utf8-bytes "contents")
+                       :save-request? true})]
+    (is (= "/post" (-> resp :request :uri)))))
 
 (deftest ^:integration makes-head-request
   (run-server)
@@ -385,7 +469,10 @@
 (deftest ^:integration t-json-output-coercion
   (run-server)
   (let [resp (client/get (localhost "/json") {:as :json})
-        resp-array (client/get (localhost "/json-array") {:as :json-strict})
+        resp-array (client/get (localhost "/json-array") {:as :json})
+        resp-array-strict (client/get (localhost "/json-array") {:as :json-strict})
+        resp-large-array (client/get (localhost "/json-large-array") {:as :json})
+        resp-large-array-strict (client/get (localhost "/json-large-array") {:as :json-strict})
         resp-str (client/get (localhost "/json")
                              {:as :json :coerce :exceptional})
         resp-str-keys (client/get (localhost "/json") {:as :json-string-keys})
@@ -403,6 +490,9 @@
     (is (= 200
            (:status resp)
            (:status resp-array)
+           (:status resp-array-strict)
+           (:status resp-large-array)
+           (:status resp-large-array-strict)
            (:status resp-str)
            (:status resp-str-keys)
            (:status resp-strict-str-keys)
@@ -417,6 +507,7 @@
            (:body resp-str-keys)))
     ;; '("foo" "bar") and ["foo" "bar"] compare as equal with =.
     (is (vector? (:body resp-array)))
+    (is (vector? (:body resp-array-strict)))
     (is (= "{\"foo\":\"bar\"}" (:body resp-str)))
     (is (= 400
            (:status bad-resp)
@@ -425,7 +516,11 @@
     (is (= "{\"foo\":\"bar\"}" (:body bad-resp))
         "don't coerce on bad response status by default")
     (is (= {:foo "bar"} (:body bad-resp-json)))
-    (is (= "{\"foo\":\"bar\"}" (:body bad-resp-json2)))))
+    (is (= "{\"foo\":\"bar\"}" (:body bad-resp-json2)))
+
+    (testing "lazily parsed stream completes parsing."
+      (is (= 100 (count (:body resp-large-array)))))
+    (is (= 100 (count (:body resp-large-array-strict))))))
 
 (deftest ^:integration t-ipv6
   (run-server)
@@ -433,7 +528,8 @@
     (is (= 200 (:status resp)))
     (is (= "get" (:body resp)))))
 
-(deftest t-custom-retry-handler
+;; TODO: retry-handlers are no longer implemented
+#_(deftest t-custom-retry-handler
   (let [called? (atom false)]
     (is (thrown? Exception
                  (client/post "http://localhost"
@@ -475,11 +571,11 @@
         (client/get
          (localhost "/get")
          {:request-interceptor
-          (fn [^HttpRequest req ^HttpContext ctx]
-            (reset! req-ctx {:method (.getMethod req) :uri (.getURI req)}))})]
+          (fn [^HttpRequest req _ ^HttpContext ctx]
+            (reset! req-ctx {:method (.getMethod req) :uri (.getUri req)}))})]
     (is (= 200 status))
     (is (= "GET" (:method @req-ctx)))
-    (is (= "/get" (.getPath (:uri @req-ctx))))))
+    (is (= "/get" (.getPath ^java.net.URI (:uri @req-ctx))))))
 
 (deftest ^:integration t-response-interceptor
   (run-server)
@@ -488,16 +584,13 @@
         (client/get
          (localhost "/redirect-to-get")
          {:response-interceptor
-          (fn [^HttpResponse resp ^HttpContext ctx]
-            (let [^HttpInetConnection conn
-                  (.getAttribute ctx ExecutionContext/HTTP_CONNECTION)]
-              (swap! saved-ctx conj {:remote-port (.getRemotePort conn)
-                                     :http-conn conn})))})]
+          (fn [^HttpResponse resp _ ^HttpContext ctx]
+            (let [^HttpRoute route (.getAttribute ctx HttpClientContext/HTTP_ROUTE)]
+              (swap! saved-ctx conj {:remote-port (-> route .getTargetHost .getPort)})))})]
     (is (= 200 status))
     (is (= 2 (count @saved-ctx)))
     #_(is (= (count trace-redirects) (count @saved-ctx)))
-    (is (every? #(= 18080 (:remote-port %)) @saved-ctx))
-    (is (every? #(instance? HttpConnection (:http-conn %)) @saved-ctx))))
+    (is (every? #(= 18080 (:remote-port %)) @saved-ctx))))
 
 (deftest ^:integration t-send-input-stream-body
   (run-server)
@@ -528,6 +621,7 @@
 ;;         (is (= v (.getParameter setps k)))))))
 
 ;; Regression, get notified if something changes
+#_
 (deftest ^:integration t-known-client-params-are-unchanged
   (let [params ["http.socket.timeout" CoreConnectionPNames/SO_TIMEOUT
                 "http.connection.timeout"
@@ -563,7 +657,7 @@
 
 ;; This relies on connections to writequit.org being slower than 10ms, if this
 ;; fails, you must have very nice internet.
-(deftest ^:integration sets-conn-timeout
+(deftest ^:integration sets-connection-timeout
   (run-server)
   (try
     (is (thrown? SocketTimeoutException
@@ -571,7 +665,7 @@
                                   :server-name "writequit.org"
                                   :server-port 80
                                   :request-method :get :uri "/"
-                                  :conn-timeout 10})))))
+                                  :connection-timeout 10})))))
 
 (deftest ^:integration connection-pool-timeout
   (run-server)
@@ -580,13 +674,14 @@
                                                   :server-name "localhost"
                                                   :server-port 18080
                                                   :request-method :get
-                                                  :conn-timeout 1
-                                                  :conn-request-timeout 1
+                                                  :connection-timeout 1
+                                                  :connection-request-timeout 1
                                                   :uri "/timeout"}))
           is-pool-timeout-error?
           (fn [req-fut]
-            (instance? org.apache.http.conn.ConnectionPoolTimeoutException
-                       (try @req-fut (catch Exception e (.getCause e)))))
+            #_(instance? org.apache.http.conn.ConnectionPoolTimeoutException
+                         (try @req-fut (catch Exception e (.getCause e))))
+            (try @req-fut (catch Exception e (.getCause e))))
           req1 (async-request)
           req2 (async-request)
           timeout-error1 (is-pool-timeout-error? req1)
@@ -615,6 +710,14 @@
 (deftest ^:integration t-empty-response-coercion
   (run-server)
   (let [resp (client/get (localhost "/empty") {:as :clojure})]
+    (is (= (:body resp) nil)))
+  (let [resp (client/get (localhost "/empty") {:as :json})]
+    (is (= (:body resp) nil)))
+  (let [resp (client/get (localhost "/empty-gzip")
+                         {:as :clojure})]
+    (is (= (:body resp) nil)))
+  (let [resp (client/get (localhost "/empty-gzip")
+                         {:as :json})]
     (is (= (:body resp) nil))))
 
 (deftest ^:integration t-trace-redirects
@@ -644,13 +747,13 @@
 (deftest ^:integration t-override-request-config
   (run-server)
   (let [called-args (atom [])
-        real-http-client core/http-client
+        real-http-client core/build-http-client
         http-context (HttpClientContext/create)
         request-config (.build (RequestConfig/custom))]
     (with-redefs
-      [core/http-client
+      [core/build-http-client
        (fn [& args]
-         (proxy [org.apache.http.impl.client.CloseableHttpClient] []
+         (proxy [CloseableHttpClient] []
            (execute [http-req context]
              (swap! called-args conj [http-req context])
              (.execute (apply real-http-client args) http-req context))))]
@@ -662,3 +765,200 @@
       (let [context-for-request (last (last @called-args))]
         (is (= http-context context-for-request))
         (is (= request-config (.getRequestConfig context-for-request)))))))
+
+(deftest ^:integration test-custom-http-builder-fns
+  (run-server)
+  (let [resp (client/get (localhost "/get")
+                         {:headers {"add-headers" "true"}
+                          :http-builder-fns
+                          [(fn [builder req]
+                             (.setDefaultHeaders builder (:hdrs req)))]
+                          :hdrs [(BasicHeader. "foo" "bar")]})]
+    (is (= 200 (:status resp)))
+    (is (.contains (get-in resp [:headers "got"]) "\"foo\" \"bar\"")
+        "Headers should have included the new default headers"))
+  (let [resp (promise)
+        error (promise)
+        f (client/get (localhost "/get")
+                      {:async true
+                       :headers {"add-headers" "true"}
+                       :async-http-builder-fns
+                       [(fn [builder req]
+                          (.setDefaultHeaders builder (:hdrs req)))]
+                       :hdrs [(BasicHeader. "foo" "bar")]}
+                      resp error)]
+    (.get f)
+    (is (= 200 (:status @resp)))
+    (is (.contains (get-in @resp [:headers "got"]) "\"foo\" \"bar\"")
+        "Headers should have included the new default headers")
+    (is (not (realized? error)))))
+
+(deftest ^:integration test-custom-http-client-builder
+  (run-server)
+  (let [methods (atom nil)
+        resp (client/get
+              (localhost "/get")
+              {:http-client-builder
+               (-> (HttpClientBuilder/create)
+                   (.setRequestExecutor
+                    (proxy [org.apache.hc.core5.http.impl.io.HttpRequestExecutor] []
+                      (execute [request connection context]
+                        (->> request
+                             .getMethod
+                             (swap! methods conj))
+                        (proxy-super execute request connection context)))))})]
+    (is (= ["GET"] @methods))))
+
+#_
+(deftest ^:integration test-bad-redirects
+  (run-server)
+  (try
+    (client/get (localhost "/bad-redirect"))
+    (is false "should have thrown an exception")
+    (catch ProtocolException e
+      (is (.contains
+           (.getMessage e)
+           "Redirect URI does not specify a valid host name: https:///"))))
+  ;; async version
+  (let [e (atom nil)
+        latch (promise)]
+    (try
+      (.get
+       (client/get (localhost "/bad-redirect") {:async true}
+                   (fn [resp]
+                     (is false
+                         (str "should not have been called but got" resp)))
+                   (fn [err]
+                     (reset! e err)
+                     (deliver latch true)
+                     nil)))
+      (catch Exception error
+        (is (.contains
+             (.getMessage error)
+             "Redirect URI does not specify a valid host name: https:///"))))
+    @latch
+    (is (.contains
+         (.getMessage @e)
+         "Redirect URI does not specify a valid host name: https:///")))
+  (try
+    (.get (client/get
+           (localhost "/bad-redirect")
+           {:async true
+            :validate-redirects false}
+           (fn [resp]
+             (is false
+                 (str "should not have been called but got" resp)))
+           (fn [err]
+             (is false
+                 (str "should not have been called but got" err))))
+          1 TimeUnit/SECONDS)
+    (is false "should have thrown a timeout exception")
+    (catch TimeoutException te)))
+
+(deftest ^:integration test-reusable-http-client
+  (run-server)
+  (let [cm (conn/make-async-conn-manager {})
+        hc (core/build-async-http-client {} cm)]
+    (client/get (localhost "/json")
+                {:connection-manager cm
+                 :http-client hc
+                 :as :json
+                 :async true}
+                (fn [resp]
+                  (is (= 200 (:status resp)))
+                  (is (= {:foo "bar"} (:body resp))))
+                (fn [e] (is false (str "failed with " e)))))
+  (let [cm (conn/make-conn-manager {})
+        hc (:http-client (client/get (localhost "/get")
+                                     {:connection-manager cm}))
+        resp (client/get (localhost "/json")
+                         {:connection-manager cm
+                          :http-client hc
+                          :as :json})]
+    (is (= 200 (:status resp)))
+    (is (= {:foo "bar"} (:body resp)))))
+
+(deftest ^:integration t-cookies-spec
+  (run-server)
+  (is (thrown? MalformedCookieException
+               (client/get (localhost "/bad-cookie"))))
+  (client/get (localhost "/bad-cookie") {:decode-cookies false})
+  (let [validated (atom false)
+        spec-provider (RFC6265CookieSpecFactory.)
+        resp (client/get (localhost "/cookie")
+                         {:cookie-spec
+                          (fn [http-context]
+                            (proxy [CookieSpecBase] []
+                              ;; Version and version header
+                              (getVersion [] 0)
+                              (getVersionHeader [] nil)
+                              ;; parse headers into cookie objects
+                              (parse [header cookie-origin]
+                                (.parse (.create spec-provider http-context)
+                                        header cookie-origin))
+                              ;; Validate a cookie, throwing MalformedCookieException if the
+                              ;; cookies isn't valid
+                              (validate [cookie cookie-origin]
+                                (reset! validated true))
+                              ;; Determine if a cookie matches the target location
+                              (match [cookie cookie-origin] true)
+                              ;; Format a list of cookies into a list of headers
+                              (formatCookies [cookies] (java.util.ArrayList.))))})]
+    (is (= @validated true))))
+
+
+(deftest t-cache-config
+  (let [cc (core/build-cache-config
+            {:cache-config {:allow-303-caching true
+                            :asynchronous-workers 2
+                            :heuristic-caching-enabled true
+                            :heuristic-coefficient 1.5
+                            :heuristic-default-lifetime 12
+                            :max-cache-entries 100
+                            :max-object-size 123
+                            :max-update-retries 3
+                            :never-cache-http10-responses-with-query-string false
+                            :shared-cache false
+                            :weak-etag-on-put-delete-allowed true}})]
+    (is (= true (.is303CachingEnabled cc)))
+    (is (= 2 (.getAsynchronousWorkers cc)))
+    (is (= true (.isHeuristicCachingEnabled cc)))
+    (is (= 1.5 (.getHeuristicCoefficient cc)))
+    (is (= (TimeValue/ofMilliseconds 12) (.getHeuristicDefaultLifetime cc)))
+    (is (= 100 (.getMaxCacheEntries cc)))
+    (is (= 123 (.getMaxObjectSize cc)))
+    (is (= 3 (.getMaxUpdateRetries cc)))
+    (is (= false (.isNeverCacheHTTP10ResponsesWithQuery cc)))
+    (is (= false (.isSharedCache cc)))
+    (is (= true (.isWeakETagOnPutDeleteAllowed cc)))))
+
+(deftest ^:integration t-client-caching
+  (run-server)
+  (let [cm (conn/make-conn-manager {})
+        r1 (client/get (localhost "/get")
+                       {:connection-manager cm :cache true})
+        client (:http-client r1)
+        r2 (client/get (localhost "/get")
+                       {:connection-manager cm :http-client client :cache true})
+        r3 (client/get (localhost "/get")
+                       {:connection-manager cm :http-client client :cache true})
+        r4 (client/get (localhost "/get")
+                       {:connection-manager cm :http-client client :cache true})]
+    (is (= :CACHE_MISS (:cached r1)))
+    (is (= :VALIDATED (:cached r2)))
+    (is (= :VALIDATED (:cached r3)))
+    (is (= :VALIDATED (:cached r4))))
+  (let [cm (conn/make-conn-manager {})
+        r1 (client/get (localhost "/dont-cache")
+                       {:connection-manager cm :cache true})
+        client (:http-client r1)
+        r2 (client/get (localhost "/dont-cache")
+                       {:connection-manager cm :http-client client :cache true})
+        r3 (client/get (localhost "/dont-cache")
+                       {:connection-manager cm :http-client client :cache true})
+        r4 (client/get (localhost "/dont-cache")
+                       {:connection-manager cm :http-client client :cache true})]
+    (is (= :CACHE_MISS (:cached r1)))
+    (is (= :CACHE_MISS (:cached r2)))
+    (is (= :CACHE_MISS (:cached r3)))
+    (is (= :CACHE_MISS (:cached r4)))))

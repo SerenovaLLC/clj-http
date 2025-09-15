@@ -1,15 +1,9 @@
 (ns clj-http.multipart
   "Namespace used for clj-http to create multipart entities and bodies."
-  (:import (java.io File InputStream)
-           (org.apache.http.entity ContentType)
-           (org.apache.http.entity.mime MultipartEntity)
-           (org.apache.http.entity.mime HttpMultipartMode)
-           (org.apache.http.entity.mime.content ContentBody
-                                                ByteArrayBody
-                                                FileBody
-                                                InputStreamBody
-                                                StringBody)
-           (org.apache.http Consts)))
+  (:import [java.io File InputStream]
+           java.nio.charset.Charset
+           [org.apache.hc.client5.http.entity.mime ByteArrayBody ContentBody FileBody HttpMultipartMode InputStreamBody MultipartEntityBuilder MultipartFormEntity StringBody]
+           [org.apache.hc.core5.http ContentType HttpEntity]))
 
 ;; we don't need to make a fake byte-array every time, only once
 (def byte-array-type (type (byte-array 0)))
@@ -118,22 +112,50 @@
      content (ContentType/create "text/plain" (encoding-to-charset encoding)))
 
     content
-    (StringBody. content (ContentType/create "text/plain" Consts/UTF_8))))
+    (StringBody. content (ContentType/create "text/plain" (Charset/forName "UTF-8")))))
 
 (defmethod make-multipart-body ContentBody
   ;; Use provided org.apache.http.entity.mime.content.ContentBody directly
   [{:keys [^ContentBody content]}]
   content)
 
+(defn- multipart-workaround
+  "Workaround for AsyncHttpClient to bypass 25kb restriction on getContent.
+  See https://github.com/dakrone/clj-http/issues/560.
+  "
+  [^MultipartFormEntity mp-entity]
+  (reify HttpEntity
+    (isRepeatable [_] (.isRepeatable mp-entity))
+    (isChunked [_] (.isChunked mp-entity))
+    (isStreaming [_] (.isStreaming mp-entity))
+    (getContentLength [_] (.getContentLength mp-entity))
+    (getContentType [_] (.getContentType mp-entity))
+    (getContentEncoding [_] (.getContentEncoding mp-entity))
+    (getContent [_]
+      (let [os (java.io.ByteArrayOutputStream.)]
+        (.writeTo mp-entity os)
+        (.flush os)
+        (java.io.ByteArrayInputStream. (.toByteArray os))))
+    (getTrailerNames [_] (.getTrailerNames mp-entity))
+    (getTrailers [_] (.getTrailers mp-entity))
+    (writeTo [_ output-stream] (.writeTo mp-entity output-stream))))
+
 (defn create-multipart-entity
-  "Takes a multipart vector of maps and creates a MultipartEntity with each
-  map added as a part, depending on the type of content."
-  [multipart]
-  (let [mp-entity (MultipartEntity. HttpMultipartMode/STRICT
-                                    nil
-                                    (encoding-to-charset "UTF-8"))]
+  "Takes a multipart vector of maps and creates a MultipartEntity with each map
+  added as a part, depending on the type of content. If a mime-subtype or
+  multipart-mode are specified, they are set on the multipart builder, otherwise
+  'form-data' and strict mode are used."
+  [multipart {:keys [mime-subtype multipart-mode multipart-charset]
+              :or {mime-subtype "form-data"
+                   multipart-mode HttpMultipartMode/STRICT}}]
+  (let [mp-entity (doto (MultipartEntityBuilder/create)
+                    (.setMode multipart-mode)
+                    (.setMimeSubtype mime-subtype))]
+    (when multipart-charset
+      (.setCharset mp-entity (encoding-to-charset multipart-charset)))
     (doseq [m multipart]
       (let [name (or (:part-name m) (:name m))
             part (make-multipart-body m)]
         (.addPart mp-entity name part)))
-    mp-entity))
+    (multipart-workaround
+     (.build mp-entity))))
