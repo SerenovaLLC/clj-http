@@ -6,31 +6,47 @@ on:
   pull_request:
     branches: [ master ]
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        java: ["8", "11", "14"]
+        java: ["8", "11", "21"]
         clojure: ["1.8", "1.9", "1.10"]
-
+        
     name: Java ${{ matrix.java }} Clojure ${{ matrix.clojure }}
     steps:
     - uses: actions/checkout@v2
-    - uses: actions/cache@v2
+    - uses: actions/cache@v4
       with:
         path: ~/.m2/repository
-        key: ${{ runner.os }}-lein-${{ hashFiles('**/project.clj') }}
+        key: ${{ runner.os }}-maven-java${{ matrix.java }}-${{ hashFiles('**/project.clj') }}
         restore-keys: |
-          ${{ runner.os }}-lein-
+          ${{ runner.os }}-maven-java${{ matrix.java }}-
 
     - name: Setup java
-      uses: actions/setup-java@v1
+      uses: actions/setup-java@v4
       with:
+        distribution: 'temurin'
         java-version: ${{ matrix.java }}
 
+    - name: Install Leiningen
+      run: |
+        curl -O https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein
+        chmod +x lein
+        sudo mv lein /usr/local/bin/
+
+    - name: Verify Leiningen installation
+      run: lein version
+
     - name: Install dependencies
-      run: lein deps
+      run: lein with-profile dev,${{matrix.clojure}} deps
+
+    - name: Clean build artifacts
+      run: lein clean
 
     - name: Run tests
       run: lein with-profile dev,${{matrix.clojure}} test :all

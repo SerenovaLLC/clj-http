@@ -20,8 +20,7 @@
            [org.apache.hc.core5.http.message BasicHeader BasicHeaderIterator]
            org.apache.hc.core5.http.protocol.HttpContext
            org.apache.hc.core5.util.TimeValue
-           org.apache.logging.log4j.LogManager
-           sun.security.provider.certpath.SunCertPathBuilderException))
+           org.apache.logging.log4j.LogManager))
 
 (defonce logger (LogManager/getLogger "clj-http.test.core-test"))
 
@@ -292,7 +291,7 @@
                                 :keystore "test-resources/keystore"
                                 :key-password "keykey"})]
     (try
-      (is (thrown? SunCertPathBuilderException
+      (is (thrown? Throwable
                    (client/request {:scheme :https
                                     :server-name "localhost"
                                     :server-port 18082

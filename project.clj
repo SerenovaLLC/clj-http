@@ -6,7 +6,6 @@
             :distribution :repo}
   :global-vars {*warn-on-reflection* false}
   :min-lein-version "2.0.0"
-  :exclusions [org.clojure/clojure]
   :dependencies [[org.apache.httpcomponents.core5/httpcore5 "5.0.1"]
                  [org.apache.httpcomponents.client5/httpclient5 "5.0.1"]
                  [org.apache.httpcomponents.client5/httpclient5-cache "5.0.1"]
