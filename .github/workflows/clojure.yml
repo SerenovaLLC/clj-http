@@ -40,7 +40,7 @@ jobs:
         sudo mv lein /usr/local/bin/
 
     - name: Install dependencies
-      run: lein deps
+      run: lein with-profile dev,${{matrix.clojure}} deps
 
     - name: Run tests
       run: lein with-profile dev,${{matrix.clojure}} test :all
