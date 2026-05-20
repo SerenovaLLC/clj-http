@@ -22,12 +22,10 @@ jobs:
     - uses: actions/checkout@v2
     - uses: actions/cache@v4
       with:
-        path: |
-          ~/.m2/repository
-          ~/.lein
-        key: ${{ runner.os }}-lein-java${{ matrix.java }}-clojure${{ matrix.clojure }}-${{ hashFiles('**/project.clj') }}
+        path: ~/.m2/repository
+        key: ${{ runner.os }}-maven-java${{ matrix.java }}-${{ hashFiles('**/project.clj') }}
         restore-keys: |
-          ${{ runner.os }}-lein-java${{ matrix.java }}-
+          ${{ runner.os }}-maven-java${{ matrix.java }}-
 
     - name: Setup java
       uses: actions/setup-java@v4
@@ -46,6 +44,9 @@ jobs:
 
     - name: Install dependencies
       run: lein with-profile dev,${{matrix.clojure}} deps
+
+    - name: Clean build artifacts
+      run: lein clean
 
     - name: Run tests
       run: lein with-profile dev,${{matrix.clojure}} test :all
